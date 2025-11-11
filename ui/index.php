@@ -19,6 +19,12 @@ function human_bytes(int $bytes): string {
     return (strpos((string)$n,'.')!==false ? number_format((float)$n, 2, '.', ',') : (string)$n) . ' ' . $units[$i];
 }
 
+function clip_text(string $text, int $limit = 8000): string {
+    if ($limit <= 0) return '';
+    if (strlen($text) <= $limit) return $text;
+    return substr($text, 0, $limit) . "\n… trimmed";
+}
+
 function safe_dirname(string $name): string {
     if (!preg_match('/^[A-Za-z0-9_.\-]+$/', $name)) { return ''; }
     return $name;
@@ -124,6 +130,67 @@ function body_size(string $path): int {
 
 // routing
 $action = $_GET['a'] ?? 'list';
+if ($action === 'repeat') {
+    if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'POST') {
+        http_response_code(405);
+        header('Allow: POST');
+        exit;
+    }
+    $rawBody = file_get_contents('php://input');
+    $payload = json_decode($rawBody ?? '', true);
+    if (!is_array($payload)) {
+        $payload = $_POST;
+    }
+    $dirInput = $payload['dir'] ?? '';
+    $dir = $dirInput !== '' ? safe_dirname((string)$dirInput) : '';
+    header('Content-Type: application/json');
+    if ($dir === '') {
+        echo json_encode(['ok' => false, 'message' => 'Invalid directory']);
+        exit;
+    }
+    $rootReal = realpath($LOG_ROOT);
+    $fullDir = $rootReal ? realpath($LOG_ROOT . '/' . $dir) : false;
+    if (!$rootReal || !$fullDir || !str_starts_with($fullDir, $rootReal) || !is_dir($fullDir)) {
+        echo json_encode(['ok' => false, 'message' => 'Directory not found']);
+        exit;
+    }
+    $script = $fullDir . '/replay.sh';
+    if (!is_file($script) || !is_readable($script)) {
+        echo json_encode(['ok' => false, 'message' => 'Replay script missing']);
+        exit;
+    }
+    $descriptorSpec = [
+        0 => ['pipe', 'r'],
+        1 => ['pipe', 'w'],
+        2 => ['pipe', 'w'],
+    ];
+    $pipes = [];
+    $start = microtime(true);
+    $process = @proc_open(['bash', $script], $descriptorSpec, $pipes, $fullDir);
+    if (!is_resource($process)) {
+        echo json_encode(['ok' => false, 'message' => 'Unable to start replay']);
+        exit;
+    }
+    fclose($pipes[0]);
+    stream_set_blocking($pipes[1], true);
+    stream_set_blocking($pipes[2], true);
+    $stdout = stream_get_contents($pipes[1]) ?: '';
+    $stderr = stream_get_contents($pipes[2]) ?: '';
+    fclose($pipes[1]);
+    fclose($pipes[2]);
+    $exitCode = proc_close($process);
+    $durationMs = (int)round((microtime(true) - $start) * 1000);
+    $stdout = clip_text($stdout, 10000);
+    $stderr = clip_text($stderr, 4000);
+    echo json_encode([
+        'ok' => true,
+        'exitCode' => $exitCode,
+        'stdout' => $stdout,
+        'stderr' => $stderr,
+        'durationMs' => $durationMs,
+    ]);
+    exit;
+}
 if ($action === 'download' && isset($_GET['dir'], $_GET['file'])) {
     $dir = safe_dirname($_GET['dir']);
     $file = basename($_GET['file']);
@@ -212,54 +279,64 @@ if ($isDetail) {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
 :root{
-  --bg:#0b0e14;--fg:#e6e6e6;--muted:#a3abb6;--card:#10141f;--accent:#5aa9ff;
-  --good:#10b981;--bad:#ef4444;--border:#1e2635;--chip:#151c2a;--chip2:#0f172a;
+  --bg:#f6f6f6;--fg:#111;--muted:#636363;--card:#ffffff;--accent:#111;
+  --border:#d9d9d9;--chip:#ededed;--chip2:#e2e2e2;--shadow:0 10px 25px rgba(0,0,0,.08);
+  --badge-fg:#2c2c2c;--badge-bg:#f0f0f0;--badge-strong:#d6d6d6;
 }
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--fg);font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Ubuntu}
+body{margin:0;background:var(--bg);color:var(--fg);font-family:"Inter",ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Ubuntu}
 a{color:var(--accent);text-decoration:none}
 a:hover{text-decoration:underline}
 .container{max-width:1200px;margin:0 auto;padding:20px}
 .header{display:flex;gap:12px;align-items:center;justify-content:space-between;margin-bottom:16px}
-.h1{font-size:22px;font-weight:800;letter-spacing:.2px}
-.card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:16px;box-shadow:0 6px 20px rgba(0,0,0,.25)}
+.h1{font-size:22px;font-weight:700;letter-spacing:.15px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:18px;box-shadow:var(--shadow)}
 .controls{display:flex;gap:8px;align-items:center}
 input[type="text"], select, button{
   background:var(--chip2);border:1px solid var(--border);color:var(--fg);
   padding:10px 12px;border-radius:10px;font-size:14px
 }
-button{cursor:pointer}
+button{cursor:pointer;transition:background-color .2s ease, color .2s ease}
 .btn{background:var(--chip);border:1px solid var(--border);padding:8px 12px;border-radius:10px}
-.btn.primary{background:var(--accent);color:#0b0e14;border-color:transparent}
-.btn.ghost{background:var(--chip2)}
+.btn.primary{background:var(--fg);color:#fff;border-color:var(--fg)}
+.btn.ghost{background:var(--chip2);color:var(--fg)}
+.btn:disabled{opacity:.6;cursor:wait}
 .row{display:grid;grid-template-columns:240px 1fr 90px 120px 150px;gap:10px;align-items:center;padding:12px;border-bottom:1px solid var(--border)}
-.row.head{font-weight:700;color:var(--muted);border-bottom:2px solid var(--border)}
+.row.head{font-weight:600;color:var(--muted);border-bottom:2px solid var(--border)}
 .grid{margin-top:8px}
-.badge{display:inline-block;font-size:12px;font-weight:700;padding:3px 9px;border-radius:999px;background:var(--chip);color:#cdd5df;border:1px solid var(--border)}
-.badge.success{background:#05331e;color:#a8f3c2}.badge.error{background:#3b0a0a;color:#fecaca}
+.badge{display:inline-block;font-size:12px;font-weight:600;padding:3px 9px;border-radius:999px;background:var(--badge-bg);color:var(--badge-fg);border:1px solid var(--border)}
+.badge.success{background:var(--badge-strong);color:#111}
+.badge.error{background:#cfcfcf;color:#111}
 .meta-grid{display:grid;grid-template-columns:180px 1fr;gap:8px;margin-bottom:6px}
 pre, textarea.code{
-  background:#0d1320;border:1px solid var(--border);padding:12px;border-radius:10px;overflow:auto;max-height:500px;color:#dbe5f3;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:13px;line-height:1.45
+  background:#fafafa;border:1px solid var(--border);padding:12px;border-radius:10px;overflow:auto;max-height:500px;color:#1f2937;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:13px;line-height:1.5;margin:0
 }
 .code-wrap{position:relative}
 .copybar{display:flex;gap:8px;justify-content:flex-end;margin-bottom:8px}
 .tabs{display:flex;gap:6px;margin-bottom:8px}
 .tabbtn{background:var(--chip);border:1px solid var(--border);padding:6px 10px;border-radius:8px;font-size:12px;cursor:pointer}
-.tabbtn.active{background:var(--accent);color:#0b0e14;border-color:transparent}
+.tabbtn.active{background:var(--fg);color:#fff;border-color:var(--fg)}
+.tabbtn[disabled]{opacity:.4;cursor:not-allowed}
 .footer{color:var(--muted);font-size:12px;margin-top:20px}
 .pagination{display:flex;gap:8px;align-items:center;justify-content:flex-end;margin-top:10px}
-.pagination a{background:var(--chip);padding:8px 12px;border-radius:10px;border:1px solid var(--border)}
-.kv{color:#a7b0bb}
+.pagination a{background:var(--chip);padding:8px 12px;border-radius:10px;border:1px solid var(--border);color:var(--fg)}
+.kv{color:var(--muted)}
 .flex2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
 @media (max-width: 920px){
   .row{grid-template-columns:1fr 1fr 80px 100px 120px}
   .flex2{grid-template-columns:1fr}
 }
-.toast{position:fixed;right:16px;bottom:16px;background:#111827;color:#e5e7eb;border:1px solid #374151;padding:10px 14px;border-radius:10px;opacity:0;transform:translateY(8px);transition:.2s;pointer-events:none}
+.toast{position:fixed;right:16px;bottom:16px;background:#111;color:#fefefe;border:1px solid #444;padding:10px 14px;border-radius:10px;opacity:0;transform:translateY(8px);transition:.2s;pointer-events:none;min-width:160px;text-align:center}
 .toast.show{opacity:1;transform:translateY(0)}
-pre{
-    max-width: 10%;
-}
+.repeat-result{margin-top:12px;border:1px solid var(--border);border-radius:12px;padding:12px;background:#f9f9f9}
+.repeat-title{font-size:13px;font-weight:600;margin-bottom:8px;color:var(--muted)}
+.json-view{background:#111822;color:#f7fafc}
+.json-view.json-enhanced{background:#111822;color:#f7fafc}
+.json-view .json-key{color:#7dd3fc}
+.json-view .json-string{color:#f9a8d4}
+.json-view .json-number{color:#d8b4fe}
+.json-view .json-boolean{color:#fcd34d}
+.json-view .json-null{color:#cbd5f5;font-style:italic}
 </style>
 </head>
 <body>
@@ -308,12 +385,18 @@ pre{
 
     <h3 style="display:flex;align-items:center;justify-content:space-between;margin-top:14px">Replay (curl)
       <span class="copybar">
+        <button class="btn ghost" id="repeatBtn" type="button" data-dir="<?= e($dirParam) ?>">Repeat</button>
         <button class="btn primary" id="copyCurlBtn" type="button">Copy curl</button>
       </span>
     </h3>
     <div class="code-wrap">
       <pre id="curlCode"><?= e($replay ?: '(replay.sh missing)') ?></pre>
       <textarea id="curlHidden" style="position:absolute;left:-9999px;top:-9999px" aria-hidden="true"><?= $replay ? e($replay) : '' ?></textarea>
+    </div>
+
+    <div id="repeatResult" class="repeat-result" hidden>
+      <div class="repeat-title">Last repeat output</div>
+      <pre id="repeatOutput"></pre>
     </div>
 
     <h3 style="margin-top:18px">Headers</h3>
@@ -343,7 +426,7 @@ pre{
           <button class="tabbtn <?= $reqPretty ? '' : 'active' ?>" data-tab="req-raw">Raw</button>
         </div>
         <div id="req-pretty" style="<?= $reqPretty ? '' : 'display:none' ?>">
-          <pre><?= $reqPretty ? e($reqPretty) : e('(not JSON or too large)') ?></pre>
+          <pre<?= $reqPretty ? ' class="json-view" data-json="' . e(base64_encode($reqPretty)) . '"' : '' ?>><?= $reqPretty ? e($reqPretty) : e('(not JSON or too large)') ?></pre>
         </div>
         <div id="req-raw" style="<?= $reqPretty ? 'display:none' : '' ?>">
           <pre><?php
@@ -361,7 +444,7 @@ pre{
           <button class="tabbtn <?= $respPretty ? '' : 'active' ?>" data-tab="resp-raw">Raw</button>
         </div>
         <div id="resp-pretty" style="<?= $respPretty ? '' : 'display:none' ?>">
-          <pre><?= $respPretty ? e($respPretty) : e('(not JSON or too large)') ?></pre>
+          <pre<?= $respPretty ? ' class="json-view" data-json="' . e(base64_encode($respPretty)) . '"' : '' ?>><?= $respPretty ? e($respPretty) : e('(not JSON or too large)') ?></pre>
         </div>
         <div id="resp-raw" style="<?= $respPretty ? 'display:none' : '' ?>">
           <pre><?php
@@ -427,12 +510,21 @@ pre{
   <div class="footer">Root: <?= e($LOG_ROOT) ?></div>
 </div>
 
-<div id="toast" class="toast">Copied!</div>
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
 <script>
 (function(){
+  const toast = document.getElementById('toast');
+  let toastTimer = null;
+  function showToast(message){
+    if (!toast) return;
+    toast.textContent = message;
+    toast.classList.add('show');
+    if (toastTimer) clearTimeout(toastTimer);
+    toastTimer = setTimeout(()=>toast.classList.remove('show'), 1600);
+  }
+
   const copyBtn = document.getElementById('copyCurlBtn');
   const hidden = document.getElementById('curlHidden');
-  const toast = document.getElementById('toast');
   if (copyBtn && hidden) {
     copyBtn.addEventListener('click', async () => {
       try {
@@ -446,15 +538,68 @@ pre{
           document.execCommand('copy');
           hidden.style.display = 'none';
         }
-        toast.classList.add('show');
-        setTimeout(()=>toast.classList.remove('show'), 1200);
+        showToast('Copied curl command');
       } catch (e) {
-        alert('Copy failed');
+        showToast('Copy failed');
       }
     });
   }
 
-  // tabs
+  const repeatBtn = document.getElementById('repeatBtn');
+  const repeatOutput = document.getElementById('repeatOutput');
+  const repeatResult = document.getElementById('repeatResult');
+  if (repeatBtn && repeatOutput && repeatResult) {
+    repeatBtn.addEventListener('click', async () => {
+      const dir = repeatBtn.getAttribute('data-dir') || '';
+      if (!dir) {
+        showToast('Missing directory');
+        return;
+      }
+      const originalText = repeatBtn.textContent;
+      repeatBtn.disabled = true;
+      repeatBtn.textContent = 'Repeating…';
+      try {
+        const response = await fetch('?a=repeat', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({dir})
+        });
+        const data = await response.json().catch(() => null);
+        if (!response.ok || !data) {
+          throw new Error('bad response');
+        }
+        if (!data.ok) {
+          showToast(data.message || 'Repeat failed');
+          if (typeof data.stderr === 'string' && data.stderr.trim()) {
+            repeatOutput.textContent = data.stderr.trim();
+            repeatResult.hidden = false;
+          }
+        } else {
+          const stdout = typeof data.stdout === 'string' ? data.stdout : '';
+          const stderr = typeof data.stderr === 'string' ? data.stderr : '';
+          const lines = [`Exit code: ${data.exitCode}`];
+          if (typeof data.durationMs === 'number') {
+            lines.push(`Duration: ${data.durationMs} ms`);
+          }
+          if (stdout.trim()) {
+            lines.push('', stdout.trim());
+          }
+          if (stderr.trim()) {
+            lines.push('', 'stderr:', stderr.trim());
+          }
+          repeatOutput.textContent = lines.join('\n');
+          repeatResult.hidden = false;
+          showToast('Request repeated');
+        }
+      } catch (err) {
+        showToast('Repeat failed');
+      } finally {
+        repeatBtn.disabled = false;
+        repeatBtn.textContent = originalText;
+      }
+    });
+  }
+
   function setupTabs(groupPrefix){
     const prettyBtn = document.querySelector('.tabbtn[data-tab="'+groupPrefix+'-pretty"]');
     const rawBtn = document.querySelector('.tabbtn[data-tab="'+groupPrefix+'-raw"]');
@@ -473,6 +618,73 @@ pre{
   }
   setupTabs('req');
   setupTabs('resp');
+
+  function escapeHtml(str){
+    return str.replace(/[&<>"']/g, (c) => {
+      switch (c) {
+        case '&': return '&amp;';
+        case '<': return '&lt;';
+        case '>': return '&gt;';
+        case '"': return '&quot;';
+        default: return '&#39;';
+      }
+    });
+  }
+
+  function decodeBase64Utf8(b64){
+    try {
+      const binary = atob(b64);
+      if (typeof TextDecoder === 'undefined') {
+        return decodeURIComponent(escape(binary));
+      }
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+      return new TextDecoder().decode(bytes);
+    } catch (err) {
+      return '';
+    }
+  }
+
+  function renderValue(value, depth){
+    const indent = '  '.repeat(depth);
+    if (Array.isArray(value)) {
+      if (!value.length) return '[]';
+      const inner = value.map((item) => indent + '  ' + renderValue(item, depth + 1)).join('\n');
+      return '[\n' + inner + '\n' + indent + ']';
+    }
+    if (value && typeof value === 'object') {
+      const entries = Object.entries(value);
+      if (!entries.length) return '{}';
+      const inner = entries.map(([key, val]) => indent + '  ' + '<span class="json-key">"' + escapeHtml(key) + '"</span>: ' + renderValue(val, depth + 1)).join('\n');
+      return '{\n' + inner + '\n' + indent + '}';
+    }
+    if (typeof value === 'string') {
+      return '<span class="json-string">"' + escapeHtml(value) + '"</span>';
+    }
+    if (typeof value === 'number') {
+      return '<span class="json-number">' + value + '</span>';
+    }
+    if (typeof value === 'boolean') {
+      return '<span class="json-boolean">' + value + '</span>';
+    }
+    return '<span class="json-null">null</span>';
+  }
+
+  document.querySelectorAll('.json-view[data-json]').forEach((pre) => {
+    const encoded = pre.getAttribute('data-json');
+    if (!encoded) return;
+    const raw = decodeBase64Utf8(encoded);
+    if (!raw) return;
+    try {
+      const parsed = JSON.parse(raw);
+      pre.innerHTML = renderValue(parsed, 0);
+      pre.classList.add('json-enhanced');
+    } catch (err) {
+      // ignore invalid json
+    }
+  });
 })();
 </script>
 </body>
